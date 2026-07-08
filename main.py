@@ -52,14 +52,12 @@ def extract_shopee_info(payload: LinkRequest):
     # 3. Chuẩn bị gọi API Affiliate Shopee
     affiliate_api_url = f"https://affiliate.shopee.vn/api/v3/offer/product?item_id={item_id}"
     
-    # Lấy Cookie và CSRFToken cấu hình sẵn từ Render Environment bọc bảo mật
+    # Lấy Cookie cấu hình sẵn từ Render Environment bọc bảo mật
     shopee_cookie = os.getenv("SHOPEE_COOKIE", "")
-    shopee_csrf = os.getenv("SHOPEE_CSRF", "")
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Cookie": shopee_cookie,
-        "X-CSRFToken": shopee_csrf,
         "Referer": "https://affiliate.shopee.vn/",
         "Accept": "application/json, text/plain, */*"
     }
@@ -69,7 +67,7 @@ def extract_shopee_info(payload: LinkRequest):
         if res.status_code != 200:
             return {
                 "status": "error",
-                "msg": f"Shopee API phản hồi lỗi HTTP {res.status_code}. Vui lòng kiểm tra Cookie/CSRF.",
+                "msg": f"Shopee API phản hồi lỗi HTTP {res.status_code}. Vui lòng kiểm tra Cookie.",
                 "extracted": {"shop_id": shop_id, "item_id": item_id}
             }
         
