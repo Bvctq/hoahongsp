@@ -1,129 +1,117 @@
 import os
 import re
 import requests
-from flask import Flask, request, jsonify
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
-app = Flask(__name__)
+app = FastAPI()
 
-# Lấy cookie từ biến môi trường Render
-SHOPEE_AFFILIATE_COOKIE = os.environ.get('SHOPEE_AFFILIATE_COOKIE', '')
+class LinkRequest(BaseModel):
+    url: str
+    cookie: str = None # Truyền cookie từ PHP sang, hoặc dùng biến môi trường trên Render
 
-HEADERS_TEMPLATE = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-}
+@app.post("/api/extract")
+async def extract_info(req: LinkRequest):
+    short_url = req.url.strip()
+    # Ưu tiên dùng cookie truyền từ PHP, nếu không có thì lấy từ biến môi trường SHOPEE_COOKIE trên Render
+    cookie = req.cookie or os.environ.get("SHOPEE_COOKIE", "")
+    
+    if not cookie:
+        raise HTTPException(status_code=400, detail="Thiếu Cookie Shopee Affiliate. Vui lòng truyền vào request hoặc set biến môi trường SHOPEE_COOKIE.")
 
-def extract_shop_item_ids(url: str):
-    """
-    Trích xuất shop_id & item_id từ URL sản phẩm Shopee.
-    Có 2 dạng:
-      - /product/<shop_id>/<item_id>
-      - /i.<shop_id>.<item_id>
-    """
-    # Dạng 1: /product/shop_id/item_id
-    match = re.search(r'/product/(\d+)/(\d+)', url)
-    if match:
-        return match.group(1), match.group(2)
-
-    # Dạng 2: i.shop_id.item_id
-    match = re.search(r'i\.(\d+)\.(\d+)', url)
-    if match:
-        return match.group(1), match.group(2)
-
-    return None, None
-
-def resolve_short_link(short_url: str):
-    """Theo tất cả redirect để lấy URL cuối cùng."""
-    try:
-        resp = requests.get(
-            short_url,
-            headers=HEADERS_TEMPLATE,
-            allow_redirects=True,
-            timeout=15
-        )
-        return resp.url
-    except Exception as e:
-        print(f"Error resolving short link: {e}")
-        return None
-
-@app.route('/get-product-info')
-def get_product_info():
-    original_url = request.args.get('url', '').strip()
-    if not original_url:
-        return jsonify({'error': 'Thiếu tham số url'}), 400
-
-    # 1. Phân giải link rút gọn -> link đích
-    final_url = resolve_short_link(original_url)
-    if not final_url:
-        return jsonify({'error': 'Không thể phân giải link rút gọn'}), 400
-
-    shop_id, item_id = extract_shop_item_ids(final_url)
-    if not item_id:
-        return jsonify({'error': 'Không tìm thấy item_id trong URL đích', 'resolved_url': final_url}), 400
-
-    # 2. Gọi API Affiliate chính thức
-    aff_api = f'https://affiliate.shopee.vn/api/v3/offer/product?item_id={item_id}'
-    aff_headers = {
-        **HEADERS_TEMPLATE,
-        'Cookie': SHOPEE_AFFILIATE_COOKIE,
-        'Referer': 'https://affiliate.shopee.vn/',
-        'Accept': 'application/json',
+    headers_req = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
     }
-
+    
+    # 1. Resolve link rút gọn (s.shopee.vn, vn.shp.ee) về link gốc
     try:
-        aff_resp = requests.get(aff_api, headers=aff_headers, timeout=15)
-        if aff_resp.status_code != 200:
-            return jsonify({'error': f'Affiliate API lỗi HTTP {aff_resp.status_code}'}), 502
-
-        data = aff_resp.json()
-        if data.get('code') != 0:
-            return jsonify({'error': data.get('msg', 'Lỗi từ Shopee Affiliate')}), 502
-
-        product = data['data']
-        batch = product.get('batch_item_for_item_card_full', {})
-        comm = product.get('commission_rate', {})
-
-        # 3. Trả về dữ liệu tinh gọn, đúng các trường bạn cần
-        result = {
-            'item_id': product.get('item_id'),
-            'shop_id': batch.get('shopid'),
-            'shop_name': batch.get('shop_name'),
-            'product_name': batch.get('name'),
-            'price': batch.get('price'),                       # giá hiện tại (đơn vị nhỏ nhất của VND, cần chia 100000)
-            'price_before_discount': batch.get('price_before_discount'),
-            'discount': batch.get('discount'),                 # ví dụ "20%"
-            'historical_sold': batch.get('historical_sold'),
-            'rating_star': batch.get('item_rating', {}).get('rating_star'),
-            'stock': batch.get('stock'),
-            'commission': product.get('commission'),           # tổng hoa hồng hiển thị (VD: "₫18.305")
-            'commission_details': {
-                'max_commission_rate': comm.get('max_commission_rate'),
-                'seller_commission_rate': comm.get('seller_commission_rate'),
-                'seller_commission': comm.get('seller_commission'),
-                'shopee_commission_rate': comm.get('shopee_commission_rate'),
-                'shopee_commission': comm.get('shopee_commission'),
-                'default_commission_rate': comm.get('default_commission_rate'),
-                'default_commission': comm.get('default_commission'),
-                'commission_cap': comm.get('commission_cap'),
-                'shopee_new_user_commission_cap': comm.get('shopee_new_user_commission_cap'),
-                'web_exist_commission': comm.get('web_exist_commission'),
-                'web_new_commission': comm.get('web_new_commission'),
-                'app_exist_commission': comm.get('app_exist_commission'),
-                'app_new_commission': comm.get('app_new_commission'),
-                'exist_platform_commission_rate': comm.get('exist_platform_commission_rate'),
-                'new_platform_commission_rate': comm.get('new_platform_commission_rate')
-            },
-            'affiliate_link': product.get('product_link'),      # link sản phẩm gốc
-            'long_link': product.get('long_link'),              # link affiliate dài
-            'shop_rating': batch.get('shop_rating'),
-            'is_official_shop': batch.get('is_official_shop'),
-            'is_preferred_plus_seller': batch.get('is_preferred_plus_seller'),
-        }
-
-        return jsonify(result)
-
+        response = requests.get(short_url, headers=headers_req, allow_redirects=True, timeout=15)
+        final_url = response.url
     except Exception as e:
-        return jsonify({'error': f'Lỗi xử lý: {str(e)}'}), 500
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+        raise HTTPException(status_code=400, detail=f"Lỗi khi resolve link: {str(e)}")
+        
+    # 2. Trích xuất shopid và itemid từ URL gốc
+    # Format: https://shopee.vn/product/542068555/45011781634
+    match = re.search(r'/product/(\d+)/(\d+)', final_url)
+    if not match:
+        match = re.search(r'(\d{6,})/(\d{6,})', final_url) # Fallback
+        
+    if not match:
+        raise HTTPException(status_code=400, detail=f"Không tìm thấy shopid và itemid từ link: {final_url}")
+        
+    shopid = match.group(1)
+    itemid = match.group(2)
+    
+    # 3. Gọi API Shopee Affiliate để lấy thông tin hoa hồng
+    affiliate_api_url = f"https://affiliate.shopee.vn/api/v3/offer/product?item_id={itemid}"
+    headers_api = {
+        "User-Agent": headers_req["User-Agent"],
+        "Cookie": cookie,
+        "Accept": "application/json",
+        "Referer": "https://affiliate.shopee.vn/"
+    }
+    
+    try:
+        aff_response = requests.get(affiliate_api_url, headers=headers_api, timeout=15)
+        aff_data = aff_response.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi khi gọi API Shopee: {str(e)}")
+        
+    if aff_data.get("code") != 0:
+        raise HTTPException(status_code=400, detail=f"Shopee API lỗi: {aff_data.get('msg', 'Unknown error')}")
+        
+    data = aff_data.get("data", {})
+    item_info = data.get("batch_item_for_item_card_full", {})
+    commission_rate_info = data.get("commission_rate", {})
+    commission_rate_detail = data.get("commission_rate_detail", {})
+    
+    # 4. Xử lý dữ liệu giá (Shopee lưu giá nhân với 100,000)
+    raw_price = int(item_info.get("price", 0))
+    price_vnd = raw_price / 100000
+    
+    raw_price_before = int(item_info.get("price_before_discount", 0))
+    price_before_vnd = raw_price_before / 100000
+    
+    # 5. Xử lý dữ liệu hoa hồng
+    seller_commission_rate_str = commission_rate_info.get("seller_commission_rate", "0%")
+    seller_commission_str = commission_rate_info.get("seller_commission", "₫0")
+    
+    # Hoa hồng cơ bản từ Shopee (thường nằm trong social_media_item_base_exist_commission_rate)
+    shopee_base_rate_raw = 0
+    shopee_detail = commission_rate_detail.get("shopee_commission_detail", {})
+    if shopee_detail:
+        shopee_base_rate_raw = shopee_detail.get("social_media_item_base_exist_commission_rate", 0)
+        if not shopee_base_rate_raw:
+            shopee_base_rate_raw = shopee_detail.get("shopee_video_item_base_exist_commission_rate", 0)
+            
+    shopee_commission_rate_str = f"{shopee_base_rate_raw / 1000}%"
+    
+    # Tính tổng tỷ lệ hoa hồng
+    try:
+        seller_rate_val = float(seller_commission_rate_str.replace('%', '').replace(',', '.'))
+        shopee_rate_val = float(shopee_commission_rate_str.replace('%', '').replace(',', '.'))
+        total_rate_str = f"{seller_rate_val + shopee_rate_val}%"
+    except:
+        total_rate_str = "N/A"
+        
+    # 6. Trả về JSON sạch
+    result = {
+        "item_id": itemid,
+        "shop_id": shopid,
+        "product_name": item_info.get("name", ""),
+        "image_url": f"https://cf.shopee.vn/file/{item_info.get('image', '')}",
+        "price_vnd": price_vnd,
+        "price_before_discount_vnd": price_before_vnd,
+        "discount": item_info.get("discount", "0%"),
+        "seller_commission_rate": seller_commission_rate_str,
+        "seller_commission": seller_commission_str,
+        "shopee_base_commission_rate": shopee_commission_rate_str,
+        "total_commission_rate": total_rate_str,
+        "sold": item_info.get("historical_sold", 0),
+        "stock": item_info.get("stock", 0),
+        "rating_star": item_info.get("item_rating", {}).get("rating_star", 0),
+        "product_link": f"https://shopee.vn/product/{shopid}/{itemid}",
+        "affiliate_link": data.get("long_link", "")
+    }
+    
+    return {"code": 0, "msg": "success", "data": result}
