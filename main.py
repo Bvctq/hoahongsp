@@ -5,7 +5,12 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 app = FastAPI(title="Shopee Affiliate Extractor")
-
+@app.get("/")
+def read_root():
+    return {
+        "status": "healthy", 
+        "message": "API Shopee Affiliate đang hoạt động! Hãy gọi vào /api/extract bằng phương thức POST."
+    }
 class LinkRequest(BaseModel):
     url: str
 
