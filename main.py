@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import copy
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -18,13 +19,12 @@ try:
         print("⚠️ CẢNH BÁO: Biến SHOPEE_HEADERS_JSON đang trống hoặc không đúng định dạng JSON.")
 except json.JSONDecodeError:
     DEFAULT_HEADERS = {}
-    print("❌ LỖI: SHOPEE_HEADERS_JSON không phải là JSON hợp lệ! API sẽ bị Shopee chặn.")
+    print("❌ LỖI: SHOPEE_HEADERS_JSON không phải là JSON hợp lệ!")
 
 # ==============================================================================
 # CÁC HÀM XỬ LÝ DỮ LIỆU
 # ==============================================================================
 def format_price(price_str):
-    """Chuyển đổi giá từ định dạng Shopee (nhân 100,000) sang chuỗi VND"""
     try:
         price = int(float(price_str))
         return f"{price // 100000:,} ₫"
@@ -32,7 +32,6 @@ def format_price(price_str):
         return "0 ₫"
 
 def extract_item_id_from_url(url: str) -> str:
-    """Trích xuất item_id từ URL Shopee"""
     match = re.search(r'/product/\d+/(\d+)', url)
     if match:
         return match.group(1)
@@ -53,20 +52,14 @@ async def read_root():
             .container { background: white; padding: 32px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); max-width: 800px; margin: auto; }
             h1 { color: #ee4d2d; }
             code { background: #f3f4f6; padding: 4px 8px; border-radius: 6px; color: #dc2626; }
-            .note { margin-top: 24px; padding: 16px; background: #fffbeb; border-left: 4px solid #f59e0b; border-radius: 6px; font-size: 0.9em; }
         </style>
     </head>
     <body>
         <div class="container">
             <h1>📊 Shopee Affiliate Product Data API</h1>
-            <p>API lấy thông tin sản phẩm và chi tiết hoa hồng (Commission & XTRA).</p>
+            <p>API đã được cập nhật để tự động điều chỉnh Referer theo từng sản phẩm.</p>
             <h3>Cách sử dụng:</h3>
             <p><code>GET /api/product-info?item_id=50812656268</code></p>
-            <p>Hoặc: <code>GET /api/product-info?url=https://shopee.vn/product/1487133538/50812656268</code></p>
-            <div class="note">
-                <strong>⚠️ Lưu ý:</strong> Header được quản lý qua biến <code>SHOPEE_HEADERS_JSON</code> trên Render. 
-                Khi Cookie hết hạn, chỉ cần cập nhật 1 biến này là xong.
-            </div>
         </div>
     </body>
     </html>
@@ -84,25 +77,33 @@ async def get_product_info(item_id: str = None, url: str = None):
             raise HTTPException(status_code=400, detail="Không thể trích xuất item_id hợp lệ từ URL")
 
     if not DEFAULT_HEADERS:
-        raise HTTPException(status_code=500, detail="Server chưa được cấu hình Header. Vui lòng kiểm tra biến SHOPEE_HEADERS_JSON.")
+        raise HTTPException(status_code=500, detail="Server chưa được cấu hình Header.")
+
+    # === QUAN TRỌNG: Tạo bản sao của header và cập nhật referer động ===
+    request_headers = copy.deepcopy(DEFAULT_HEADERS)
+    request_headers["referer"] = f"https://affiliate.shopee.vn/offer/product_offer/{item_id}"
+    
+    # Loại bỏ trace cũ nếu có, để tránh bị Shopee check mismatch
+    if "referer" in request_headers and "?trace=" in request_headers["referer"]:
+        request_headers["referer"] = request_headers["referer"].split("?trace=")[0]
+    # ================================================================
 
     api_url = f"https://affiliate.shopee.vn/api/v3/offer/product?item_id={item_id}"
     
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(api_url, headers=DEFAULT_HEADERS, timeout=15.0)
+            response = await client.get(api_url, headers=request_headers, timeout=15.0)
             response.raise_for_status()
             data = response.json()
             
             if data.get("code") != 0:
-                raise HTTPException(status_code=400, detail=f"Lỗi từ API Shopee: {data.get('msg')}. Có thể Header đã hết hạn.")
+                raise HTTPException(status_code=400, detail=f"Lỗi từ API Shopee: {data.get('msg')}.")
                 
             product = data.get("data", {})
             comm_rate = product.get("commission_rate", {})
             
-            # Xác định có phải XTRA hay không
             seller_comm = product.get("seller_commission", "₫0")
-            is_xtra = not seller_comm.startswith("₫0") and seller_comm != "0"
+            is_xtra = not str(seller_comm).startswith("₫0") and str(seller_comm) != "0"
             
             result = {
                 "itemId": int(product.get("item_id", 0)),
@@ -131,7 +132,7 @@ async def get_product_info(item_id: str = None, url: str = None):
             
         except httpx.HTTPStatusError as e:
             if e.response.status_code in [401, 403]:
-                raise HTTPException(status_code=403, detail="Lỗi 403: Header/Cookie đã hết hạn. Vui lòng cập nhật biến SHOPEE_HEADERS_JSON trên Render.")
+                raise HTTPException(status_code=403, detail="Lỗi 403: Header/Cookie đã hết hạn.")
             raise HTTPException(status_code=e.response.status_code, detail=f"Lỗi HTTP: {e.response.status_code}")
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Lỗi máy chủ: {str(e)}")
