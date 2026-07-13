@@ -3,13 +3,13 @@ import json
 import re
 import copy
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Shopee Auto Extract & Affiliate API")
+app = FastAPI(title="Shopee Auto Extract & Affiliate API v2")
 
 # ==============================================================================
-# ĐỌC HEADER TỪ BIẾN MÔI TRƯỜNG (KHÔNG bao gồm 'referer' cố định)
+# ĐỌC HEADER TỪ BIẾN MÔI TRƯỜNG
 # ==============================================================================
 headers_json_str = os.getenv("SHOPEE_HEADERS_JSON", "{}")
 try:
@@ -26,7 +26,6 @@ except json.JSONDecodeError:
 def format_price(price_str):
     try:
         price = int(float(str(price_str).replace('₫', '').replace(',', '').replace('.', '')))
-        # Shopee lưu giá nhân 100,000. Nếu giá trị đã là VND thật, ta giữ nguyên, nếu là định dạng Shopee thì chia
         if price > 100000000: 
             return f"{price // 100000:,} ₫"
         return f"{price:,} ₫"
@@ -36,13 +35,17 @@ def format_price(price_str):
 async def resolve_and_extract(url: str):
     """Tự động mở link ngắn, theo dõi redirect và trích xuất shop_id, item_id"""
     try:
-        # follow_redirects=True là chìa khóa để mở được vn.shp.ee hoặc s.shopee.vn
+        # QUAN TRỌNG: Phải dùng DEFAULT_HEADERS khi resolve để tránh bị Shopee chặn bằng Captcha
+        headers_to_use = copy.deepcopy(DEFAULT_HEADERS)
+        if "user-agent" not in headers_to_use:
+            headers_to_use["user-agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        
         async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
-            response = await client.get(url)
+            response = await client.get(url, headers=headers_to_use)
             final_url = str(response.url)
             
-            # Regex tìm kiếm định dạng: shopee.vn/product/[shop_id]/[item_id]
-            match = re.search(r'shopee\.vn/product/(\d+)/(\d+)', final_url)
+            # Regex linh hoạt hơn: bắt bất kỳ đoạn /product/[số]/[số] nào trong URL
+            match = re.search(r'/product/(\d+)/(\d+)', final_url)
             if match:
                 return {
                     "shop_id": match.group(1),
@@ -50,9 +53,9 @@ async def resolve_and_extract(url: str):
                     "final_url": final_url
                 }
             else:
-                return None
+                return {"error": f"Không tìm thấy định dạng product trong URL đích: {final_url}"}
     except Exception as e:
-        raise Exception(f"Không thể mở link hoặc link không hợp lệ: {str(e)}")
+        return {"error": f"Lỗi khi giải nén link: {str(e)}"}
 
 # ==============================================================================
 # API ENDPOINT CHÍNH
@@ -64,17 +67,19 @@ async def get_product_info(url: str):
 
     # Bước 1: Tự động giải nén link ngắn và lấy ID
     extracted = await resolve_and_extract(url)
-    if not extracted:
-        return JSONResponse(status_code=400, content={"status": "error", "message": "Link không phải là link sản phẩm Shopee hợp lệ hoặc không thể giải nén."})
+    
+    if "error" in extracted:
+        return JSONResponse(status_code=400, content={"status": "error", "message": extracted["error"]})
 
     item_id = extracted["item_id"]
     shop_id = extracted["shop_id"]
 
-    # Bước 2: Chuẩn bị Header động (Quan trọng: Referer phải khớp với item_id)
+    # Bước 2: Chuẩn bị Header động
     if not DEFAULT_HEADERS:
         return JSONResponse(status_code=500, content={"status": "error", "message": "Server chưa được cấu hình Header (SHOPEE_HEADERS_JSON)."})
     
     request_headers = copy.deepcopy(DEFAULT_HEADERS)
+    # Tự động gán referer khớp với item_id để qua mặt WAF của Shopee
     request_headers["referer"] = f"https://affiliate.shopee.vn/offer/product_offer/{item_id}"
     
     # Bước 3: Gọi API Affiliate của Shopee
@@ -83,11 +88,21 @@ async def get_product_info(url: str):
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(api_url, headers=request_headers, timeout=15.0)
-            response.raise_for_status()
+            
+            # Nếu HTTP status không phải 200, ném lỗi chi tiết
+            if response.status_code != 200:
+                return JSONResponse(status_code=response.status_code, content={
+                    "status": "error", 
+                    "message": f"Shopee trả về HTTP {response.status_code}. Chi tiết: {response.text[:200]}"
+                })
+                
             data = response.json()
             
             if data.get("code") != 0:
-                return JSONResponse(status_code=400, content={"status": "error", "message": f"Shopee trả về lỗi: {data.get('msg')}. Có thể Cookie/Header đã hết hạn."})
+                return JSONResponse(status_code=400, content={
+                    "status": "error", 
+                    "message": f"Shopee API báo lỗi. Code: {data.get('code')}, Msg: {data.get('msg')}. (Có thể Cookie/Header đã hết hạn)"
+                })
                 
             product = data.get("data", {})
             comm_rate = product.get("commission_rate", {})
@@ -95,7 +110,7 @@ async def get_product_info(url: str):
             seller_comm = str(product.get("seller_commission", "0"))
             is_xtra = not seller_comm.startswith("0") and seller_comm != "₫0"
             
-            # Bước 4: Trả về dữ liệu đã được làm sạch cho PHP
+            # Bước 4: Trả về dữ liệu đã được làm sạch
             result = {
                 "status": "success",
                 "data": {
@@ -124,9 +139,7 @@ async def get_product_info(url: str):
             return JSONResponse(content=result)
             
     except httpx.HTTPStatusError as e:
-        if e.response.status_code in [401, 403]:
-            return JSONResponse(status_code=403, content={"status": "error", "message": "Lỗi 403: Header/Cookie trên Render đã hết hạn. Cần cập nhật lại biến môi trường."})
-        return JSONResponse(status_code=500, content={"status": "error", "message": f"Lỗi kết nối Shopee: {e.response.status_code}"})
+        return JSONResponse(status_code=500, content={"status": "error", "message": f"Lỗi kết nối HTTP: {e.response.status_code} - {e.response.text[:100]}"})
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": f"Lỗi máy chủ: {str(e)}"})
 
