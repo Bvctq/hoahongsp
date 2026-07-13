@@ -6,7 +6,7 @@ import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Shopee Auto Extract & Affiliate API v2")
+app = FastAPI(title="Shopee Auto Extract & Affiliate API v3")
 
 # ==============================================================================
 # ĐỌC HEADER TỪ BIẾN MÔI TRƯỜNG
@@ -35,7 +35,6 @@ def format_price(price_str):
 async def resolve_and_extract(url: str):
     """Tự động mở link ngắn, theo dõi redirect và trích xuất shop_id, item_id"""
     try:
-        # QUAN TRỌNG: Phải dùng DEFAULT_HEADERS khi resolve để tránh bị Shopee chặn bằng Captcha
         headers_to_use = copy.deepcopy(DEFAULT_HEADERS)
         if "user-agent" not in headers_to_use:
             headers_to_use["user-agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -44,8 +43,10 @@ async def resolve_and_extract(url: str):
             response = await client.get(url, headers=headers_to_use)
             final_url = str(response.url)
             
-            # Regex linh hoạt hơn: bắt bất kỳ đoạn /product/[số]/[số] nào trong URL
-            match = re.search(r'/product/(\d+)/(\d+)', final_url)
+            # REGEX MỚI: Tìm 2 dãy số liên tiếp (từ 9 đến 12 chữ số) ngăn cách bởi dấu /
+            # Điều này bắt được cả: /product/123/456, /ten-shop/123/456, hoặc /i.123.456
+            match = re.search(r'/(?:product/|i\.\d+\.|[a-zA-Z0-9_-]+/)?(\d{9,12})/(\d{9,12})', final_url)
+            
             if match:
                 return {
                     "shop_id": match.group(1),
@@ -53,7 +54,16 @@ async def resolve_and_extract(url: str):
                     "final_url": final_url
                 }
             else:
-                return {"error": f"Không tìm thấy định dạng product trong URL đích: {final_url}"}
+                # Fallback: Nếu regex trên không khớp, thử tìm bất kỳ 2 dãy số dài nào
+                fallback_match = re.search(r'/(\d{9,12})/(\d{9,12})', final_url)
+                if fallback_match:
+                    return {
+                        "shop_id": fallback_match.group(1),
+                        "item_id": fallback_match.group(2),
+                        "final_url": final_url
+                    }
+                else:
+                    return {"error": f"Không thể trích xuất ID từ URL. Link đích: {final_url[:100]}..."}
     except Exception as e:
         return {"error": f"Lỗi khi giải nén link: {str(e)}"}
 
@@ -79,7 +89,6 @@ async def get_product_info(url: str):
         return JSONResponse(status_code=500, content={"status": "error", "message": "Server chưa được cấu hình Header (SHOPEE_HEADERS_JSON)."})
     
     request_headers = copy.deepcopy(DEFAULT_HEADERS)
-    # Tự động gán referer khớp với item_id để qua mặt WAF của Shopee
     request_headers["referer"] = f"https://affiliate.shopee.vn/offer/product_offer/{item_id}"
     
     # Bước 3: Gọi API Affiliate của Shopee
@@ -89,7 +98,6 @@ async def get_product_info(url: str):
         async with httpx.AsyncClient() as client:
             response = await client.get(api_url, headers=request_headers, timeout=15.0)
             
-            # Nếu HTTP status không phải 200, ném lỗi chi tiết
             if response.status_code != 200:
                 return JSONResponse(status_code=response.status_code, content={
                     "status": "error", 
@@ -110,7 +118,6 @@ async def get_product_info(url: str):
             seller_comm = str(product.get("seller_commission", "0"))
             is_xtra = not seller_comm.startswith("0") and seller_comm != "₫0"
             
-            # Bước 4: Trả về dữ liệu đã được làm sạch
             result = {
                 "status": "success",
                 "data": {
